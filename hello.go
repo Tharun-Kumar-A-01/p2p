@@ -170,21 +170,21 @@ func initialModel() model {
 	ti.Placeholder = "Enter peer multiaddr or press Enter to wait for connections"
 	ti.Focus()
 	ti.CharLimit = 400
-	ti.Width = 80
+	ti.Width = 400
 
 	// Setup textarea for chat
 	ta := textarea.New()
 	ta.Placeholder = "Type your message..."
 	ta.Prompt = "  ┃ "
 	ta.CharLimit = 280
-	ta.SetWidth(80)
+	ta.SetWidth(400)
 	ta.SetHeight(2)
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.ShowLineNumbers = false
 	ta.KeyMap.InsertNewline.SetEnabled(false)
 
 	// Setup viewport for messages
-	vp := viewport.New(80, 20)
+	vp := viewport.New(400, 60)
 
 	return model{
 		state:       stateSetup,
