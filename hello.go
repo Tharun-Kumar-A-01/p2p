@@ -1,394 +1,460 @@
+// p2p_chat_ui.go
 package main
 
 import (
-	"bufio"
-	"context"
-	"fmt"
-	"log"
-	"strings"
-	"sync"
+    "bufio"
+    "context"
+    "fmt"
+    "os"
+    "strings"
+    "time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	libp2p "github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multiaddr"
+    "github.com/atotto/clipboard"
+    "github.com/charmbracelet/bubbles/textarea"
+    "github.com/charmbracelet/bubbles/viewport"
+    tea "github.com/charmbracelet/bubbletea"
+    "github.com/charmbracelet/lipgloss"
+    libp2p "github.com/libp2p/go-libp2p"
+    "github.com/libp2p/go-libp2p/core/host"
+    "github.com/libp2p/go-libp2p/core/network"
+    "github.com/libp2p/go-libp2p/core/peer"
+    "github.com/multiformats/go-multiaddr"
 )
 
+// Protocol constant
 const ChatProtocol = "/p2p-chat/1.0.0"
-const gap = "\n\n"
 
-// Custom message types for Bubble Tea
-type (
-	errMsg           error
-	messageReceivedMsg string
-	connectionStatusMsg string
-	peerConnectedMsg   peer.ID
-)
-
-// Connection states
-type connectionState int
-
-const (
-	stateDisconnected connectionState = iota
-	stateConnecting
-	stateConnected
-	stateWaitingForConnection
-)
-
-type p2pChat struct {
-	host     host.Host
-	ctx      context.Context
-	streams  map[peer.ID]network.Stream
-	streamMu sync.RWMutex
-	program  *tea.Program
+// Message types for the UI
+type Message struct {
+    Content   string
+    From      string
+    Timestamp time.Time
+    IsLocal   bool
 }
 
-func newP2PChat(ctx context.Context, program *tea.Program) (*p2pChat, error) {
-	h, err := libp2p.New(libp2p.EnableHolePunching())
-	if err != nil {
-		return nil, err
-	}
-
-	chat := &p2pChat{
-		host:    h,
-		ctx:     ctx,
-		streams: make(map[peer.ID]network.Stream),
-		program: program,
-	}
-
-	h.SetStreamHandler(ChatProtocol, chat.handleIncomingStream)
-	return chat, nil
+type ConnectionStatus struct {
+    PeerID    string
+    Connected bool
 }
 
-func (c *p2pChat) handleIncomingStream(s network.Stream) {
-	peerID := s.Conn().RemotePeer()
-	
-	c.streamMu.Lock()
-	c.streams[peerID] = s
-	c.streamMu.Unlock()
+type copiedMsg bool
 
-	c.program.Send(peerConnectedMsg(peerID))
-	
-	go func() {
-		defer func() {
-			s.Close()
-			c.streamMu.Lock()
-			delete(c.streams, peerID)
-			c.streamMu.Unlock()
-		}()
-
-		r := bufio.NewReader(s)
-		for {
-			msg, err := r.ReadString('\n')
-			if err != nil {
-				c.program.Send(connectionStatusMsg(fmt.Sprintf("Peer %s disconnected", peerID.ShortString())))
-				return
-			}
-			c.program.Send(messageReceivedMsg(fmt.Sprintf("Peer %s: %s", peerID.ShortString(), strings.TrimSpace(msg))))
-		}
-	}()
+// Custom tea.Msg types
+type incomingMsg Message
+type connectionUpdate ConnectionStatus
+type hostReady struct {
+    host  host.Host
+    addr  string // single IPv6 multiaddr
 }
 
-func (c *p2pChat) connectToPeer(addr string) error {
-	remoteAddr, err := multiaddr.NewMultiaddr(addr)
-	if err != nil {
-		return fmt.Errorf("invalid multiaddr: %w", err)
-	}
-
-	peerinfo, err := peer.AddrInfoFromP2pAddr(remoteAddr)
-	if err != nil {
-		return fmt.Errorf("failed to parse peer info: %w", err)
-	}
-
-	if err := c.host.Connect(c.ctx, *peerinfo); err != nil {
-		return fmt.Errorf("connection failed: %w", err)
-	}
-
-	s, err := c.host.NewStream(c.ctx, peerinfo.ID, ChatProtocol)
-	if err != nil {
-		return fmt.Errorf("failed to create stream: %w", err)
-	}
-
-	c.streamMu.Lock()
-	c.streams[peerinfo.ID] = s
-	c.streamMu.Unlock()
-
-	return nil
-}
-
-func (c *p2pChat) sendMessage(message string) {
-	c.streamMu.RLock()
-	defer c.streamMu.RUnlock()
-
-	for peerID, stream := range c.streams {
-		if _, err := stream.Write([]byte(message + "\n")); err != nil {
-			c.program.Send(connectionStatusMsg(fmt.Sprintf("Failed to send to %s: %s", peerID.ShortString(), err.Error())))
-		}
-	}
-}
-
-func (c *p2pChat) getAddresses() []string {
-	var addrs []string
-	for _, addr := range c.host.Addrs() {
-		addrs = append(addrs, fmt.Sprintf("%s/p2p/%s", addr, c.host.ID()))
-	}
-	return addrs
-}
-
-type appState int
-
-const (
-	stateSetup appState = iota
-	stateChat
+// Styles
+var (
+    appStyle = lipgloss.NewStyle().Padding(1, 2)
+    titleStyle = lipgloss.NewStyle().Bold(true).
+        Foreground(lipgloss.Color("99")).
+        Background(lipgloss.Color("63")).
+        Padding(0, 1)
+    statusBarStyle = lipgloss.NewStyle().
+        Foreground(lipgloss.Color("241")).
+        Background(lipgloss.Color("236"))
+    localMsgStyle = lipgloss.NewStyle().
+        Foreground(lipgloss.Color("86")).
+        Bold(true)
+    remoteMsgStyle = lipgloss.NewStyle().
+        Foreground(lipgloss.Color("214"))
+    systemMsgStyle = lipgloss.NewStyle().
+        Foreground(lipgloss.Color("245")).
+        Italic(true)
+    helpStyle = lipgloss.NewStyle().
+        Foreground(lipgloss.Color("241"))
 )
 
 type model struct {
-	state       appState
-	connState   connectionState
-	viewport    viewport.Model
-	textarea    textarea.Model
-	textinput   textinput.Model
-	messages    []string
-	senderStyle lipgloss.Style
-	peerStyle   lipgloss.Style
-	systemStyle lipgloss.Style
-	p2p         *p2pChat
-	err         error
-	width       int
-	height      int
+    host         host.Host
+    ctx          context.Context
+    messages     []Message
+    viewport     viewport.Model
+    textarea     textarea.Model
+    ready        bool
+    width        int
+    height       int
+    peerID       string
+    listenAddr   string // single IPv6 multiaddr
+    connectedTo  map[string]bool
+    connectInput string
+    state        string // "chat" or "connect"
+    copied       bool   // was just copied
 }
 
-func initialModel() model {
-	// Setup text input for peer address
-	ti := textinput.New()
-	ti.Placeholder = "Enter peer multiaddr or press Enter to wait for connections"
-	ti.Focus()
-	ti.CharLimit = 400
-	ti.Width = 400
+func initialModel(ctx context.Context) model {
+    ta := textarea.New()
+    ta.Placeholder = "Type a message..."
+    ta.Focus()
+    ta.Prompt = "│ "
+    ta.CharLimit = 280
+    ta.SetWidth(30)
+    ta.SetHeight(3)
+    ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+    ta.ShowLineNumbers = false
 
-	// Setup textarea for chat
-	ta := textarea.New()
-	ta.Placeholder = "Type your message..."
-	ta.Prompt = "  ┃ "
-	ta.CharLimit = 280
-	ta.SetWidth(400)
-	ta.SetHeight(2)
-	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
-	ta.ShowLineNumbers = false
-	ta.KeyMap.InsertNewline.SetEnabled(false)
+    vp := viewport.New(30, 20)
+    vp.SetContent("")
 
-	// Setup viewport for messages
-	vp := viewport.New(400, 60)
-
-	return model{
-		state:       stateSetup,
-		connState:   stateDisconnected,
-		textinput:   ti,
-		textarea:    ta,
-		viewport:    vp,
-		messages:    []string{},
-		senderStyle: lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true),
-		peerStyle:   lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Bold(true),
-		systemStyle: lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true),
-	}
+    return model{
+        ctx:         ctx,
+        textarea:    ta,
+        viewport:    vp,
+        messages:    []Message{},
+        connectedTo: make(map[string]bool),
+        state:       "connect",
+    }
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(
-		textinput.Blink,
-		textarea.Blink,
-	)
+    return tea.Batch(
+        textarea.Blink,
+        m.initP2P(),
+    )
+}
+
+func (m model) initP2P() tea.Cmd {
+    return func() tea.Msg {
+        h, err := libp2p.New(libp2p.EnableHolePunching())
+        if err != nil {
+            return Message{
+                Content:   fmt.Sprintf("Failed to create host: %v", err),
+                From:      "System",
+                Timestamp: time.Now(),
+                IsLocal:   false,
+            }
+        }
+
+        // Prefer IPv6 multiaddr
+        var ipv6Addr string
+        for _, addr := range h.Addrs() {
+            if strings.HasPrefix(addr.String(), "/ip6/") {
+                ipv6Addr = fmt.Sprintf("%s/p2p/%s", addr, h.ID())
+                break
+            }
+        }
+        if ipv6Addr == "" {
+            // fallback to any addr if no IPv6 found
+            ipv6Addr = fmt.Sprintf("%s/p2p/%s", h.Addrs()[0], h.ID())
+        }
+
+        return hostReady{
+            host: h,
+            addr: ipv6Addr,
+        }
+    }
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmds []tea.Cmd
+    var (
+        taCmd tea.Cmd
+        vpCmd tea.Cmd
+    )
 
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		
-		if m.state == stateSetup {
-			m.textinput.Width = msg.Width - 4
-		} else {
-			m.viewport.Width = msg.Width
-			m.textarea.SetWidth(msg.Width)
-			m.viewport.Height = msg.Height - m.textarea.Height() - lipgloss.Height(gap) - 2
-			
-			if len(m.messages) > 0 {
-				m.viewport.SetContent(strings.Join(m.messages, "\n"))
-			}
-			m.viewport.GotoBottom()
-		}
+    m.textarea, taCmd = m.textarea.Update(msg)
+    m.viewport, vpCmd = m.viewport.Update(msg)
 
-	case tea.KeyMsg:
-		if m.state == stateSetup {
-			switch msg.Type {
-			case tea.KeyCtrlC, tea.KeyEsc:
-				return m, tea.Quit
-			case tea.KeyEnter:
-				return m.handleSetupEnter()
-			}
-			
-			var cmd tea.Cmd
-			m.textinput, cmd = m.textinput.Update(msg)
-			cmds = append(cmds, cmd)
-		} else {
-			switch msg.Type {
-			case tea.KeyCtrlC, tea.KeyEsc:
-				return m, tea.Quit
-			case tea.KeyEnter:
-				if m.textarea.Value() != "" {
-					message := m.textarea.Value()
-					m.messages = append(m.messages, m.senderStyle.Render("You: ")+message)
-					m.viewport.SetContent(strings.Join(m.messages, "\n"))
-					m.textarea.Reset()
-					m.viewport.GotoBottom()
-					
-					if m.p2p != nil {
-						m.p2p.sendMessage(message)
-					}
-				}
-			}
-			
-			var cmd tea.Cmd
-			m.textarea, cmd = m.textarea.Update(msg)
-			cmds = append(cmds, cmd)
-		}
+    switch msg := msg.(type) {
+    case tea.WindowSizeMsg:
+        m.width = msg.Width
+        m.height = msg.Height
 
-	case messageReceivedMsg:
-		m.messages = append(m.messages, m.peerStyle.Render(string(msg)))
-		m.viewport.SetContent(strings.Join(m.messages, "\n"))
-		m.viewport.GotoBottom()
+        if !m.ready {
+            m.viewport = viewport.New(msg.Width-4, msg.Height-10)
+            m.viewport.YPosition = 3
+            m.viewport.HighPerformanceRendering = false
+            m.textarea.SetWidth(msg.Width - 4)
+            m.ready = true
+        } else {
+            m.viewport.Width = msg.Width - 4
+            m.viewport.Height = msg.Height - 10
+            m.textarea.SetWidth(msg.Width - 4)
+        }
 
-	case connectionStatusMsg:
-		m.messages = append(m.messages, m.systemStyle.Render("System: "+string(msg)))
-		m.viewport.SetContent(strings.Join(m.messages, "\n"))
-		m.viewport.GotoBottom()
+        m.viewport.SetContent(m.renderMessages())
 
-	case peerConnectedMsg:
-		peerID := peer.ID(msg)
-		m.messages = append(m.messages, m.systemStyle.Render(fmt.Sprintf("System: Peer %s connected", peerID.ShortString())))
-		m.viewport.SetContent(strings.Join(m.messages, "\n"))
-		m.viewport.GotoBottom()
-		m.connState = stateConnected
+    case hostReady:
+        m.host = msg.host
+        m.peerID = msg.host.ID().String()
+        m.listenAddr = msg.addr
 
-	case errMsg:
-		m.err = msg
-	}
+        m.host.SetStreamHandler(ChatProtocol, func(s network.Stream) {
+            go m.handleStream(s)
+        })
 
-	var vpCmd tea.Cmd
-	m.viewport, vpCmd = m.viewport.Update(msg)
-	cmds = append(cmds, vpCmd)
+        m.messages = append(m.messages, Message{
+            Content:   fmt.Sprintf("Host initialized. Your Peer ID: %s", m.peerID),
+            From:      "System",
+            Timestamp: time.Now(),
+            IsLocal:   false,
+        })
+        m.viewport.SetContent(m.renderMessages())
+        m.viewport.GotoBottom()
 
-	return m, tea.Batch(cmds...)
+    case incomingMsg:
+        m.messages = append(m.messages, Message(msg))
+        m.viewport.SetContent(m.renderMessages())
+        m.viewport.GotoBottom()
+
+    case connectionUpdate:
+        if msg.Connected {
+            m.connectedTo[msg.PeerID] = true
+            m.messages = append(m.messages, Message{
+                Content:   fmt.Sprintf("Connected to peer: %s", msg.PeerID),
+                From:      "System",
+                Timestamp: time.Now(),
+                IsLocal:   false,
+            })
+        } else {
+            delete(m.connectedTo, msg.PeerID)
+            m.messages = append(m.messages, Message{
+                Content:   fmt.Sprintf("Disconnected from peer: %s", msg.PeerID),
+                From:      "System",
+                Timestamp: time.Now(),
+                IsLocal:   false,
+            })
+        }
+        m.viewport.SetContent(m.renderMessages())
+        m.viewport.GotoBottom()
+
+    case tea.KeyMsg:
+        switch msg.Type {
+        case tea.KeyCtrlC, tea.KeyEsc:
+            return m, tea.Quit
+
+        case tea.KeyCtrlN:
+            m.state = "connect"
+            m.textarea.Reset()
+            m.textarea.Placeholder = "Enter peer multiaddr..."
+            m.textarea.Focus()
+
+        case tea.KeyCtrlD:
+            if m.state == "connect" {
+                m.state = "chat"
+                m.textarea.Reset()
+                m.textarea.Placeholder = "Type a message..."
+                m.textarea.Focus()
+            }
+
+        case tea.KeyEnter:
+            if m.state == "connect" {
+                addr := strings.TrimSpace(m.textarea.Value())
+                if addr != "" {
+                    cmd := m.connectToPeer(addr)
+                    m.state = "chat"
+                    m.textarea.Reset()
+                    m.textarea.Placeholder = "Type a message..."
+                    return m, cmd
+                }
+            } else {
+                text := strings.TrimSpace(m.textarea.Value())
+                if text != "" {
+                    m.messages = append(m.messages, Message{
+                        Content:   text,
+                        From:      "You",
+                        Timestamp: time.Now(),
+                        IsLocal:   true,
+                    })
+
+                    if m.host != nil {
+                        go m.broadcastMessage(text)
+                    }
+
+                    m.textarea.Reset()
+                    m.viewport.SetContent(m.renderMessages())
+                    m.viewport.GotoBottom()
+                }
+            }
+
+        // Clipboard copy hotkey
+        case tea.KeyRunes:
+            if msg.String() == "c" &&
+                m.state == "chat" &&
+                m.listenAddr != "" {
+                clipboard.WriteAll(m.listenAddr)
+                m.copied = true
+                // Reset message after 2 seconds
+                return m, func() tea.Msg {
+                    time.Sleep(2 * time.Second)
+                    return copiedMsg(false)
+                }
+            }
+        }
+
+    case copiedMsg:
+        m.copied = bool(msg)
+    }
+
+    return m, tea.Batch(taCmd, vpCmd)
 }
 
-func (m model) handleSetupEnter() (tea.Model, tea.Cmd) {
-	ctx := context.Background()
-	program := tea.NewProgram(m) // This will be replaced with the actual program instance
+func (m model) connectToPeer(addrStr string) tea.Cmd {
+    return func() tea.Msg {
+        remoteAddr, err := multiaddr.NewMultiaddr(addrStr)
+        if err != nil {
+            return incomingMsg{
+                Content:   fmt.Sprintf("Invalid multiaddr: %v", err),
+                From:      "System",
+                Timestamp: time.Now(),
+                IsLocal:   false,
+            }
+        }
+        peerinfo, err := peer.AddrInfoFromP2pAddr(remoteAddr)
+        if err != nil {
+            return incomingMsg{
+                Content:   fmt.Sprintf("Failed to parse peer info: %v", err),
+                From:      "System",
+                Timestamp: time.Now(),
+                IsLocal:   false,
+            }
+        }
+        if err := m.host.Connect(m.ctx, *peerinfo); err != nil {
+            return incomingMsg{
+                Content:   fmt.Sprintf("Connection failed: %v", err),
+                From:      "System",
+                Timestamp: time.Now(),
+                IsLocal:   false,
+            }
+        }
+        s, err := m.host.NewStream(m.ctx, peerinfo.ID, ChatProtocol)
+        if err != nil {
+            return incomingMsg{
+                Content:   fmt.Sprintf("Failed to create stream: %v", err),
+                From:      "System",
+                Timestamp: time.Now(),
+                IsLocal:   false,
+            }
+        }
+        go m.handleStream(s)
+        return connectionUpdate{
+            PeerID:    peerinfo.ID.String(),
+            Connected: true,
+        }
+    }
+}
 
-	p2p, err := newP2PChat(ctx, program)
-	if err != nil {
-		m.err = err
-		return m, nil
-	}
+func (m model) broadcastMessage(text string) {
+    for _, conn := range m.host.Network().Conns() {
+        stream, err := m.host.NewStream(m.ctx, conn.RemotePeer(), ChatProtocol)
+        if err != nil {
+            continue
+        }
+        defer stream.Close()
+        stream.Write([]byte(text + "\n"))
+    }
+}
 
-	m.p2p = p2p
-	peerAddr := strings.TrimSpace(m.textinput.Value())
+func (m model) handleStream(s network.Stream) {
+    defer s.Close()
+    r := bufio.NewReader(s)
+    peerID := s.Conn().RemotePeer().String()
 
-	// Initialize chat messages with connection info
-	m.messages = []string{
-		m.systemStyle.Render("System: P2P Chat initialized"),
-		m.systemStyle.Render(fmt.Sprintf("System: Your Peer ID: %s", p2p.host.ID())),
-		m.systemStyle.Render("System: Listening addresses:"),
-	}
+    for {
+        msg, err := r.ReadString('\n')
+        if err != nil {
+            // Connection closed
+            p := tea.NewProgram(nil)
+            p.Send(connectionUpdate{
+                PeerID:    peerID,
+                Connected: false,
+            })
+            return
+        }
+        // Send message to UI
+        p := tea.NewProgram(nil)
+        p.Send(incomingMsg{
+            Content:   strings.TrimSpace(msg),
+            From:      fmt.Sprintf("Peer[%s]", peerID[:8]),
+            Timestamp: time.Now(),
+            IsLocal:   false,
+        })
+    }
+}
 
-	for _, addr := range p2p.getAddresses() {
-		m.messages = append(m.messages, m.systemStyle.Render(fmt.Sprintf("System:  - %s", addr)))
-	}
+func (m model) renderMessages() string {
+    var sb strings.Builder
 
-	if peerAddr != "" {
-		m.connState = stateConnecting
-		m.messages = append(m.messages, m.systemStyle.Render("System: Connecting to peer..."))
-		
-		go func() {
-			if err := p2p.connectToPeer(peerAddr); err != nil {
-				program.Send(connectionStatusMsg(fmt.Sprintf("Connection failed: %s", err.Error())))
-			} else {
-				program.Send(connectionStatusMsg("Connected to peer successfully"))
-			}
-		}()
-	} else {
-		m.connState = stateWaitingForConnection
-		m.messages = append(m.messages, m.systemStyle.Render("System: Waiting for incoming connections..."))
-	}
+    for _, msg := range m.messages {
+        timestamp := msg.Timestamp.Format("15:04:05")
 
-	m.state = stateChat
-	m.textarea.Focus()
-	m.viewport.SetContent(strings.Join(m.messages, "\n"))
-	m.viewport.GotoBottom()
+        var style lipgloss.Style
+        if msg.From == "System" {
+            style = systemMsgStyle
+        } else if msg.IsLocal {
+            style = localMsgStyle
+        } else {
+            style = remoteMsgStyle
+        }
 
-	return m, nil
+        line := fmt.Sprintf("[%s] %s: %s", timestamp, msg.From, msg.Content)
+        sb.WriteString(style.Render(line) + "\n")
+    }
+
+    return sb.String()
 }
 
 func (m model) View() string {
-	if m.state == stateSetup {
-		return lipgloss.JoinVertical(
-			lipgloss.Left,
-			lipgloss.NewStyle().Bold(true).Render("P2P Chat - Setup"),
-			"",
-			"Enter the multiaddr of the peer you want to connect to,",
-			"or press Enter to wait for incoming connections.",
-			"",
-			m.textinput.View(),
-			"",
-			"Press Ctrl+C to quit",
-		)
-	}
+    if !m.ready {
+        return "\n  Initializing..."
+    }
 
-	statusLine := ""
-	switch m.connState {
-	case stateConnecting:
-		statusLine = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render("● Connecting...")
-	case stateConnected:
-		statusLine = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("● Connected")
-	case stateWaitingForConnection:
-		statusLine = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render("● Waiting for connections...")
-	default:
-		statusLine = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render("● Disconnected")
-	}
+    // Title
+    title := titleStyle.Render(" 🌐 P2P Chat ")
 
-	header := lipgloss.JoinHorizontal(
-		lipgloss.Left,
-		lipgloss.NewStyle().Bold(true).Render("P2P Chat"),
-		" ",
-		statusLine,
-	)
+    // Status bar
+    var status string
+    if m.host != nil {
+        connCount := len(m.connectedTo)
+        status = fmt.Sprintf(" ID: %s | Peers: %d | Ctrl+N: Connect | Ctrl+C: Quit",
+            m.peerID[:8], connCount)
+    } else {
+        status = " Initializing P2P host..."
+    }
+    statusBar := statusBarStyle.Copy().Width(m.width - 4).Render(status)
 
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		header,
-		m.viewport.View(),
-		gap,
-		m.textarea.View(),
-	)
+    // Mode indicator
+    modeText := ""
+    if m.state == "connect" {
+        modeText = helpStyle.Render("📡 Enter peer multiaddr and press Enter (Ctrl+D to cancel)")
+    }
+
+    // Listen address + copy button/hotkey
+    addrText := ""
+    if m.listenAddr != "" && m.state == "chat" {
+        line := fmt.Sprintf("Your address: %s   [c] Copy", m.listenAddr)
+        if m.copied {
+            line += " (Copied!)"
+        }
+        addrText = helpStyle.Render(line)
+    }
+
+    return appStyle.Render(
+        lipgloss.JoinVertical(
+            lipgloss.Left,
+            title,
+            m.viewport.View(),
+            modeText,
+            addrText,
+            m.textarea.View(),
+            statusBar,
+        ),
+    )
 }
 
 func main() {
-	p := tea.NewProgram(
-		initialModel(),
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
-	)
+    ctx := context.Background()
+    p := tea.NewProgram(
+        initialModel(ctx),
+        tea.WithAltScreen(),
+        tea.WithMouseCellMotion(),
+    )
 
-	if _, err := p.Run(); err != nil {
-		log.Fatal(err)
-	}
+    if _, err := p.Run(); err != nil {
+        fmt.Printf("Error: %v", err)
+        os.Exit(1)
+    }
 }
